@@ -9,9 +9,21 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from catboost import CatBoostRegressor, Pool
+import json
 
 from . import config, constants
-from .features import add_aggregate_features, handle_missing_values
+from .features import (
+    add_aggregate_features,
+    add_latent_features,
+    add_latent_dot_products,
+    apply_als_models,
+    apply_surprise_models,
+    compute_implicit_latent_factors,
+    compute_latent_factors,
+    handle_missing_values,
+    train_als_models,
+    train_surprise_models,
+)
 
 
 def predict() -> None:
@@ -44,9 +56,21 @@ def predict() -> None:
     print(f"Train set: {len(train_set):,} rows")
     print(f"Test set: {len(test_set):,} rows")
 
+    print("\nBuilding latent factors from full train data...")
+    user_factors, book_factors = compute_latent_factors(train_set, n_components=config.LATENT_DIM)
+    user_factors_imp, book_factors_imp = compute_implicit_latent_factors(n_components=config.LATENT_DIM)
+
     # Compute aggregate features on ALL train data (to use for test predictions)
     print("\nComputing aggregate features on all train data...")
     test_set_with_agg = add_aggregate_features(test_set.copy(), train_set)
+    test_set_with_agg = add_latent_features(test_set_with_agg, user_factors, book_factors)
+    test_set_with_agg = add_latent_features(test_set_with_agg, user_factors_imp, book_factors_imp)
+    test_set_with_agg = add_latent_dot_products(test_set_with_agg)
+    print("Fitting collaborative models on full train data for inference...")
+    surprise_models = train_surprise_models(train_set)
+    test_set_with_agg = apply_surprise_models(test_set_with_agg, surprise_models)
+    als_models = train_als_models(train_set)
+    test_set_with_agg = apply_als_models(test_set_with_agg, als_models)
 
     # Handle missing values (use train_set for fill values)
     print("Handling missing values...")
@@ -95,11 +119,13 @@ def predict() -> None:
         lgb_preds_list.append(lgb_model.predict(X_test))
     lgb_preds = np.mean(lgb_preds_list, axis=0)
 
-    cat_features = [f for f in features if not f.startswith("tfidf_") and not f.startswith("bert_")]
-    cat_feature_cols = [c for c in cat_features if c in config.CAT_FEATURES and X_test[c].dtype.name in ("category", "object")]
-    cat_features_idx = [cat_features.index(c) for c in cat_feature_cols]
+    cat_features_base = [f for f in features if not f.startswith("tfidf_") and not f.startswith("bert_")]
+    cat_feature_cols = [
+        c for c in cat_features_base if c in config.CAT_FEATURES and X_test[c].dtype.name in ("category", "object")
+    ]
+    cat_features_idx = [cat_features_base.index(c) for c in cat_feature_cols]
 
-    X_test_cat = X_test.copy()
+    X_test_cat = X_test[cat_features_base].copy()
     for col in cat_feature_cols:
         X_test_cat[col] = X_test_cat[col].astype(str)
 
@@ -108,6 +134,19 @@ def predict() -> None:
 
     w_lgb = config.ENSEMBLE_WEIGHTS["lgb"]
     w_cat = config.ENSEMBLE_WEIGHTS["cat"]
+    calibration_path = config.MODEL_DIR / constants.CALIBRATION_FILENAME
+    if calibration_path.exists():
+        with open(calibration_path, "r", encoding="utf-8") as f:
+            calibration = json.load(f)
+        w_lgb = float(calibration.get("w_lgb", w_lgb))
+        w_cat = float(calibration.get("w_cat", w_cat))
+        norm = w_lgb + w_cat
+        if norm > 0:
+            w_lgb, w_cat = w_lgb / norm, w_cat / norm
+        print(f"Using calibrated weights from {calibration_path}: w_lgb={w_lgb:.2f}, w_cat={w_cat:.2f}")
+    else:
+        print(f"Calibration file not found at {calibration_path}, using config weights w_lgb={w_lgb:.2f} w_cat={w_cat:.2f}")
+
     test_preds = w_lgb * lgb_preds + w_cat * cat_preds
     clipped_preds = np.clip(test_preds, constants.PREDICTION_MIN_VALUE, constants.PREDICTION_MAX_VALUE)
 

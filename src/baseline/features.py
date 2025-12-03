@@ -3,25 +3,40 @@ Feature engineering script.
 """
 
 import time
+from collections.abc import Mapping
 
 import joblib
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from scipy import sparse
 from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer
+from implicit.als import AlternatingLeastSquares
+
+try:
+    from surprise import Dataset, KNNBaseline, Reader, SVD, SVDpp
+
+    HAVE_SURPRISE = True
+except ImportError:  # pragma: no cover - optional dependency
+    HAVE_SURPRISE = False
 
 from . import config, constants
 
 
 def compute_latent_factors(
-    train_df: pd.DataFrame, n_components: int = 32
+    train_df: pd.DataFrame, n_components: int = 32, prefix: str = "lf", use_binary: bool = False
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Build lightweight user/book latent factors via truncated SVD on rating matrix."""
-    interactions = train_df[[constants.COL_USER_ID, constants.COL_BOOK_ID, config.TARGET]].dropna()
+    value_col = config.TARGET if not use_binary else None
+    if value_col:
+        interactions = train_df[[constants.COL_USER_ID, constants.COL_BOOK_ID, value_col]].dropna()
+    else:
+        interactions = train_df[[constants.COL_USER_ID, constants.COL_BOOK_ID]].drop_duplicates()
+
     if interactions.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -32,15 +47,15 @@ def compute_latent_factors(
     if max_components < 2:
         return pd.DataFrame(), pd.DataFrame()
 
-    ratings = interactions[config.TARGET].to_numpy()
+    ratings = interactions[value_col].to_numpy() if value_col else np.ones(len(interactions))
     matrix = sparse.coo_matrix((ratings, (user_codes, book_codes)), shape=(len(user_uniques), len(book_uniques)))
 
     svd = TruncatedSVD(n_components=max_components, random_state=config.RANDOM_STATE)
     user_latent = svd.fit_transform(matrix)
     book_latent = svd.components_.T
 
-    user_cols = [f"lf_user_{i}" for i in range(user_latent.shape[1])]
-    book_cols = [f"lf_book_{i}" for i in range(book_latent.shape[1])]
+    user_cols = [f"{prefix}_user_{i}" for i in range(user_latent.shape[1])]
+    book_cols = [f"{prefix}_book_{i}" for i in range(book_latent.shape[1])]
 
     user_factors = pd.DataFrame(user_latent, columns=user_cols)
     user_factors[constants.COL_USER_ID] = pd.Series(user_uniques, index=user_factors.index).astype(np.int64)
@@ -49,6 +64,144 @@ def compute_latent_factors(
     book_factors[constants.COL_BOOK_ID] = pd.Series(book_uniques, index=book_factors.index).astype(np.int64)
 
     return user_factors, book_factors
+
+
+def _prepare_surprise_trainset(train_df: pd.DataFrame):
+    """Prepare Surprise trainset from a pandas DataFrame."""
+    if train_df.empty or not HAVE_SURPRISE or not config.USE_SURPRISE:
+        return None
+
+    reader = Reader(rating_scale=(constants.PREDICTION_MIN_VALUE, constants.PREDICTION_MAX_VALUE))
+    data = Dataset.load_from_df(
+        train_df[[constants.COL_USER_ID, constants.COL_BOOK_ID, config.TARGET]].astype(
+            {constants.COL_USER_ID: int, constants.COL_BOOK_ID: int, config.TARGET: float}
+        ),
+        reader,
+    )
+    return data.build_full_trainset()
+
+
+def train_surprise_models(train_df: pd.DataFrame) -> Mapping[str, object]:
+    """Fit a small suite of Surprise models on the provided training split."""
+    if not config.USE_SURPRISE or not HAVE_SURPRISE:
+        return {}
+
+    trainset = _prepare_surprise_trainset(train_df)
+    if trainset is None:
+        return {}
+
+    models: dict[str, object] = {
+        constants.F_SVD_PRED: SVD(**config.SURPRISE_SVD_PARAMS),
+        constants.F_SVDPP_PRED: SVDpp(**config.SURPRISE_SVDPP_PARAMS),
+        constants.F_KNN_PRED: KNNBaseline(**config.SURPRISE_KNN_PARAMS),
+    }
+    for model in models.values():
+        model.fit(trainset)
+    return models
+
+
+def apply_surprise_models(df: pd.DataFrame, models: Mapping[str, object]) -> pd.DataFrame:
+    """Generate Surprise-based predictions for each (user, book) pair in df."""
+    if not models or not HAVE_SURPRISE:
+        return df
+    if df.empty:
+        return df
+
+    testset = list(
+        zip(
+            df[constants.COL_USER_ID].astype(int),
+            df[constants.COL_BOOK_ID].astype(int),
+            np.zeros(len(df), dtype=float),
+            strict=False,
+        )
+    )
+    for col_name, model in models.items():
+        preds = model.test(testset)
+        df[col_name] = np.array([p.est for p in preds], dtype=float)
+    return df
+
+
+def _als_predict_batch(
+    model: AlternatingLeastSquares, user_map: dict[int, int], book_map: dict[int, int], df: pd.DataFrame
+) -> np.ndarray:
+    """Vectorized ALS dot-product predictions for rows in df."""
+    u_ids = df[constants.COL_USER_ID].to_numpy()
+    b_ids = df[constants.COL_BOOK_ID].to_numpy()
+
+    valid_indices: list[int] = []
+    user_indices: list[int] = []
+    book_indices: list[int] = []
+    for idx, (u_raw, b_raw) in enumerate(zip(u_ids, b_ids, strict=False)):
+        u_idx = user_map.get(int(u_raw))
+        b_idx = book_map.get(int(b_raw))
+        if u_idx is None or b_idx is None:
+            continue
+        valid_indices.append(idx)
+        user_indices.append(u_idx)
+        book_indices.append(b_idx)
+
+    preds = np.full(len(df), np.nan, dtype=float)
+    if valid_indices:
+        dot_products = np.sum(
+            model.user_factors[user_indices] * model.item_factors[book_indices],
+            axis=1,
+        )
+        preds[np.array(valid_indices, dtype=int)] = dot_products
+    return preds
+
+
+def train_als_models(train_df: pd.DataFrame) -> Mapping[str, tuple[AlternatingLeastSquares, dict[int, int], dict[int, int]]]:
+    """Train ALS models on explicit and implicit signals."""
+    if not config.USE_IMPLICIT:
+        return {}
+
+    interactions = train_df[[constants.COL_USER_ID, constants.COL_BOOK_ID, config.TARGET]].dropna()
+    if interactions.empty:
+        return {}
+
+    user_codes, user_uniques = pd.factorize(interactions[constants.COL_USER_ID])
+    book_codes, book_uniques = pd.factorize(interactions[constants.COL_BOOK_ID])
+
+    ratings = interactions[config.TARGET].to_numpy()
+    ratings = np.clip(ratings, 0.1, None)
+
+    item_user_explicit = sparse.coo_matrix(
+        (ratings, (book_codes, user_codes)), shape=(len(book_uniques), len(user_uniques))
+    ).tocsr()
+    item_user_implicit = sparse.coo_matrix(
+        (np.ones_like(ratings), (book_codes, user_codes)), shape=(len(book_uniques), len(user_uniques))
+    ).tocsr()
+
+    als_params = config.IMPLICIT_ALS_PARAMS.copy()
+    model_imp = AlternatingLeastSquares(**als_params)
+    model_imp.fit(item_user_implicit)
+
+    als_params_exp = config.IMPLICIT_ALS_PARAMS.copy()
+    als_params_exp["alpha"] = als_params_exp.get("alpha", 1.0) * 0.5
+    model_exp = AlternatingLeastSquares(**als_params_exp)
+    model_exp.fit(item_user_explicit)
+
+    user_map = {int(u): idx for idx, u in enumerate(user_uniques)}
+    book_map = {int(b): idx for idx, b in enumerate(book_uniques)}
+
+    return {
+        constants.F_ALS_IMPLICIT_PRED: (model_imp, user_map, book_map),
+        constants.F_ALS_EXPLICIT_PRED: (model_exp, user_map, book_map),
+    }
+
+
+def apply_als_models(
+    df: pd.DataFrame, models: Mapping[str, tuple[AlternatingLeastSquares, dict[int, int], dict[int, int]]]
+) -> pd.DataFrame:
+    """Apply trained ALS models to generate prediction features."""
+    if not models:
+        return df
+    if df.empty:
+        return df
+
+    for col_name, (model, user_map, book_map) in models.items():
+        df[col_name] = _als_predict_batch(model, user_map, book_map, df)
+    return df
 
 
 def add_latent_features(
@@ -61,6 +214,34 @@ def add_latent_features(
     df = df.merge(user_factors, on=constants.COL_USER_ID, how="left")
     df = df.merge(book_factors, on=constants.COL_BOOK_ID, how="left")
     return df
+
+
+def add_latent_dot_products(df: pd.DataFrame) -> pd.DataFrame:
+    """Adds dot-product predictions from latent factors."""
+    exp_user_cols = sorted([c for c in df.columns if c.startswith("lf_user_")], key=lambda x: int(x.split("_")[-1]))
+    exp_book_cols = sorted([c for c in df.columns if c.startswith("lf_book_")], key=lambda x: int(x.split("_")[-1]))
+    if exp_user_cols and exp_book_cols and len(exp_user_cols) == len(exp_book_cols):
+        u = df[exp_user_cols].to_numpy()
+        b = df[exp_book_cols].to_numpy()
+        df[constants.F_LF_EXPLICIT_PRED] = (u * b).sum(axis=1)
+
+    imp_user_cols = sorted([c for c in df.columns if c.startswith("lf_imp_user_")], key=lambda x: int(x.split("_")[-1]))
+    imp_book_cols = sorted([c for c in df.columns if c.startswith("lf_imp_book_")], key=lambda x: int(x.split("_")[-1]))
+    if imp_user_cols and imp_book_cols and len(imp_user_cols) == len(imp_book_cols):
+        u = df[imp_user_cols].to_numpy()
+        b = df[imp_book_cols].to_numpy()
+        df[constants.F_LF_IMPLICIT_PRED] = (u * b).sum(axis=1)
+
+    return df
+
+
+def compute_implicit_latent_factors(n_components: int = 32, prefix: str = "lf_imp") -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Compute latent factors on binary interactions (has_read=0/1) to capture preference structure."""
+    raw_train = pd.read_csv(
+        config.RAW_DATA_DIR / constants.TRAIN_FILENAME,
+        usecols=[constants.COL_USER_ID, constants.COL_BOOK_ID],
+    ).drop_duplicates()
+    return compute_latent_factors(raw_train, n_components=n_components, prefix=prefix, use_binary=True)
 
 
 def add_basic_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -86,6 +267,14 @@ def add_basic_features(df: pd.DataFrame) -> pd.DataFrame:
         df[constants.F_TS_WEEKDAY] = df[constants.COL_TIMESTAMP].dt.weekday
         df[constants.F_TS_HOUR] = df[constants.COL_TIMESTAMP].dt.hour
         df[constants.F_BOOK_AGE_AT_TS] = df[constants.F_TS_YEAR] - df[constants.COL_PUBLICATION_YEAR]
+        ref_time = None
+        if constants.COL_SOURCE in df.columns:
+            ref_time = df[df[constants.COL_SOURCE] == constants.VAL_SOURCE_TRAIN][constants.COL_TIMESTAMP].max()
+        if ref_time is None or pd.isna(ref_time):
+            ref_time = df[constants.COL_TIMESTAMP].max()
+        df[constants.F_INTERACTION_AGE_DAYS] = (
+            ref_time - df[constants.COL_TIMESTAMP]
+        ).dt.total_seconds() / 86400.0
     return df
 
 
@@ -147,6 +336,16 @@ def add_aggregate_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataF
     print("Adding aggregate features...")
 
     global_mean = train_df[config.TARGET].mean()
+    alpha_user, alpha_book, alpha_author = 8.0, 18.0, 12.0
+
+    def _bayes_smooth(mean_col: pd.Series, cnt_col: pd.Series, alpha: float) -> pd.Series:
+        return (mean_col * cnt_col + global_mean * alpha) / (cnt_col + alpha)
+
+    if constants.COL_TIMESTAMP in train_df.columns and not pd.api.types.is_datetime64_any_dtype(
+        train_df[constants.COL_TIMESTAMP]
+    ):
+        train_df = train_df.copy()
+        train_df[constants.COL_TIMESTAMP] = pd.to_datetime(train_df[constants.COL_TIMESTAMP], errors="coerce")
 
     # User-based aggregates
     user_agg = train_df.groupby(constants.COL_USER_ID)[config.TARGET].agg(["mean", "count"]).reset_index()
@@ -156,6 +355,9 @@ def add_aggregate_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataF
         constants.F_USER_RATINGS_COUNT,
     ]
     user_agg[constants.F_USER_BIAS] = user_agg[constants.F_USER_MEAN_RATING] - global_mean
+    user_agg[constants.F_USER_BAYES_MEAN_RATING] = _bayes_smooth(
+        user_agg[constants.F_USER_MEAN_RATING], user_agg[constants.F_USER_RATINGS_COUNT], alpha_user
+    )
 
     # Book-based aggregates
     book_agg = train_df.groupby(constants.COL_BOOK_ID)[config.TARGET].agg(["mean", "count"]).reset_index()
@@ -165,6 +367,30 @@ def add_aggregate_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataF
         constants.F_BOOK_RATINGS_COUNT,
     ]
     book_agg[constants.F_BOOK_BIAS] = book_agg[constants.F_BOOK_MEAN_RATING] - global_mean
+    book_agg[constants.F_BOOK_BAYES_MEAN_RATING] = _bayes_smooth(
+        book_agg[constants.F_BOOK_MEAN_RATING], book_agg[constants.F_BOOK_RATINGS_COUNT], alpha_book
+    )
+
+    recency_user = pd.DataFrame()
+    recency_book = pd.DataFrame()
+    if constants.COL_TIMESTAMP in train_df.columns:
+        ref_time = train_df[constants.COL_TIMESTAMP].max()
+        half_life_days = 180.0
+        ts_df = train_df.dropna(subset=[constants.COL_TIMESTAMP])
+        if not ts_df.empty:
+            ts_df = ts_df.copy()
+            ts_df["_age_days"] = (ref_time - ts_df[constants.COL_TIMESTAMP]).dt.total_seconds() / 86400.0
+            ts_df["_w"] = np.exp(-np.log(2) * ts_df["_age_days"] / half_life_days)
+            recency_user = (
+                ts_df.groupby(constants.COL_USER_ID)
+                .apply(lambda g: np.average(g[config.TARGET], weights=g["_w"]))
+                .reset_index(name=constants.F_RECENCY_WEIGHTED_USER_MEAN)
+            )
+            recency_book = (
+                ts_df.groupby(constants.COL_BOOK_ID)
+                .apply(lambda g: np.average(g[config.TARGET], weights=g["_w"]))
+                .reset_index(name=constants.F_RECENCY_WEIGHTED_BOOK_MEAN)
+            )
 
     # Author-based aggregates
     author_agg = train_df.groupby(constants.COL_AUTHOR_ID)[config.TARGET].agg(["mean", "count"]).reset_index()
@@ -174,6 +400,9 @@ def add_aggregate_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataF
         constants.F_AUTHOR_RATINGS_COUNT,
     ]
     author_agg[constants.F_AUTHOR_BIAS] = author_agg[constants.F_AUTHOR_MEAN_RATING] - global_mean
+    author_agg[constants.F_AUTHOR_BAYES_MEAN_RATING] = _bayes_smooth(
+        author_agg[constants.F_AUTHOR_MEAN_RATING], author_agg[constants.F_AUTHOR_RATINGS_COUNT], alpha_author
+    )
 
     # Recency-aware features
     ref_time = train_df[constants.COL_TIMESTAMP].max()
@@ -336,6 +565,10 @@ def add_aggregate_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataF
     df = df.merge(user_agg, on=constants.COL_USER_ID, how="left")
     df = df.merge(book_agg, on=constants.COL_BOOK_ID, how="left")
     df = df.merge(author_agg, on=constants.COL_AUTHOR_ID, how="left")
+    if not recency_user.empty:
+        df = df.merge(recency_user, on=constants.COL_USER_ID, how="left")
+    if not recency_book.empty:
+        df = df.merge(recency_book, on=constants.COL_BOOK_ID, how="left")
     df = df.merge(user_time_stats, on=constants.COL_USER_ID, how="left")
     df = df.merge(book_time_stats, on=constants.COL_BOOK_ID, how="left")
     df = df.merge(user_dispersion, on=constants.COL_USER_ID, how="left")
@@ -359,6 +592,18 @@ def add_aggregate_features(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataF
         df = df.merge(user_genre_agg, on=[constants.COL_USER_ID, constants.COL_MAIN_GENRE], how="left")
 
     df = df.merge(user_author_agg, on=[constants.COL_USER_ID, constants.COL_AUTHOR_ID], how="left")
+
+    # Strong priors for the model to fall back to on sparse users/items
+    df[constants.F_BASELINE_USER_BOOK] = (
+        global_mean
+        + df[constants.F_USER_BIAS].fillna(0)
+        + df[constants.F_BOOK_BIAS].fillna(0)
+    )
+    df[constants.F_BASELINE_BAYES_BLEND] = (
+        0.6 * df[constants.F_USER_BAYES_MEAN_RATING].fillna(global_mean)
+        + 0.35 * df[constants.F_BOOK_BAYES_MEAN_RATING].fillna(global_mean)
+        + 0.05 * df[constants.F_AUTHOR_BAYES_MEAN_RATING].fillna(global_mean)
+    )
     return df
 
 
@@ -388,6 +633,73 @@ def add_genre_features(df: pd.DataFrame, book_genres_df: pd.DataFrame) -> pd.Dat
 
     df = df.merge(genre_counts, on=constants.COL_BOOK_ID, how="left")
     df = df.merge(primary_genres, on=constants.COL_BOOK_ID, how="left")
+    return df
+
+
+def add_preference_ratios(df: pd.DataFrame) -> pd.DataFrame:
+    """Adds user preference ratios (genre/author/language/publisher) from full raw interactions."""
+    print("Adding user preference ratios from full interactions...")
+    raw_train = pd.read_csv(
+        config.RAW_DATA_DIR / constants.TRAIN_FILENAME,
+        usecols=[constants.COL_USER_ID, constants.COL_BOOK_ID, constants.COL_HAS_READ],
+    )
+
+    book_meta = df[
+        [
+            constants.COL_BOOK_ID,
+            constants.COL_MAIN_GENRE,
+            constants.COL_AUTHOR_ID,
+            constants.COL_LANGUAGE,
+            constants.COL_PUBLISHER,
+        ]
+    ].drop_duplicates(subset=[constants.COL_BOOK_ID])
+    raw_train = raw_train.merge(book_meta, on=constants.COL_BOOK_ID, how="left")
+
+    # Totals per user
+    total_read = raw_train[raw_train[constants.COL_HAS_READ] == 1].groupby(constants.COL_USER_ID).size()
+    total_all = raw_train.groupby(constants.COL_USER_ID).size()
+
+    def _ratio(frame: pd.DataFrame, col: str, denom: pd.Series, out_col: str) -> pd.DataFrame:
+        cnts = frame.groupby([constants.COL_USER_ID, col]).size().rename("_cnt").reset_index()
+        cnts[out_col] = cnts.apply(lambda r: r["_cnt"] / max(denom.get(r[constants.COL_USER_ID], 0), 1), axis=1)
+        return cnts.drop(columns=["_cnt"])
+
+    genre_read_ratio = _ratio(
+        raw_train[raw_train[constants.COL_HAS_READ] == 1],
+        constants.COL_MAIN_GENRE,
+        total_read,
+        constants.F_USER_GENRE_READ_RATIO,
+    )
+    genre_wishlist_ratio = _ratio(
+        raw_train[raw_train[constants.COL_HAS_READ] == 0],
+        constants.COL_MAIN_GENRE,
+        total_all,
+        constants.F_USER_GENRE_WISHLIST_RATIO,
+    )
+    author_read_ratio = _ratio(
+        raw_train[raw_train[constants.COL_HAS_READ] == 1],
+        constants.COL_AUTHOR_ID,
+        total_read,
+        constants.F_USER_AUTHOR_READ_RATIO,
+    )
+    language_read_ratio = _ratio(
+        raw_train[raw_train[constants.COL_HAS_READ] == 1],
+        constants.COL_LANGUAGE,
+        total_read,
+        constants.F_USER_LANGUAGE_READ_RATIO,
+    )
+    publisher_read_ratio = _ratio(
+        raw_train[raw_train[constants.COL_HAS_READ] == 1],
+        constants.COL_PUBLISHER,
+        total_read,
+        constants.F_USER_PUBLISHER_READ_RATIO,
+    )
+
+    df = df.merge(genre_read_ratio, on=[constants.COL_USER_ID, constants.COL_MAIN_GENRE], how="left")
+    df = df.merge(genre_wishlist_ratio, on=[constants.COL_USER_ID, constants.COL_MAIN_GENRE], how="left")
+    df = df.merge(author_read_ratio, on=[constants.COL_USER_ID, constants.COL_AUTHOR_ID], how="left")
+    df = df.merge(language_read_ratio, on=[constants.COL_USER_ID, constants.COL_LANGUAGE], how="left")
+    df = df.merge(publisher_read_ratio, on=[constants.COL_USER_ID, constants.COL_PUBLISHER], how="left")
     return df
 
 
@@ -512,8 +824,8 @@ def add_bert_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_df
             print(f"GPU memory limited to {config.BERT_GPU_MEMORY_FRACTION * 100:.0f}% of available memory")
 
         # Load tokenizer and model
-        tokenizer = AutoTokenizer.from_pretrained(config.BERT_MODEL_NAME)
-        model = AutoModel.from_pretrained(config.BERT_MODEL_NAME)
+        tokenizer = AutoTokenizer.from_pretrained(config.BERT_MODEL_NAME, trust_remote_code=True)
+        model = AutoModel.from_pretrained(config.BERT_MODEL_NAME, trust_remote_code=True)
         model.to(config.BERT_DEVICE)
         model.eval()
 
@@ -525,6 +837,9 @@ def add_bert_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_df
         unique_books = all_descriptions.drop_duplicates(subset=[constants.COL_BOOK_ID])
         book_ids = unique_books[constants.COL_BOOK_ID].to_numpy()
         descriptions = unique_books[constants.COL_DESCRIPTION].to_numpy().tolist()
+        use_e5_prefix = "e5" in config.BERT_MODEL_NAME.lower()
+        if use_e5_prefix:
+            descriptions = [f"passage: {text}" for text in descriptions]
 
         # Initialize embeddings dictionary
         embeddings_dict = {}
@@ -567,6 +882,7 @@ def add_bert_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_df
 
                 # Mean pooling
                 mean_pooled = sum_embeddings / sum_mask
+                mean_pooled = F.normalize(mean_pooled, p=2, dim=1)
 
                 # Convert to numpy and store
                 batch_embeddings = mean_pooled.cpu().numpy()
@@ -598,11 +914,16 @@ def add_bert_features(df: pd.DataFrame, _train_df: pd.DataFrame, descriptions_df
 
     # Optionally compress embeddings with SVD for robustness
     svd_path = config.MODEL_DIR / constants.BERT_SVD_FILENAME
+    svd_components = min(
+        config.BERT_SVD_COMPONENTS,
+        config.BERT_EMBEDDING_DIM - 1,
+        max(embeddings_array.shape[0] - 1, 1),
+    )
     if svd_path.exists():
         svd = joblib.load(svd_path)
     else:
         svd = TruncatedSVD(
-            n_components=min(config.BERT_SVD_COMPONENTS, config.BERT_EMBEDDING_DIM - 1),
+            n_components=svd_components,
             random_state=config.RANDOM_STATE,
         )
         svd.fit(embeddings_array)
@@ -670,6 +991,30 @@ def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFr
         df[constants.F_AGE_BUCKET_MEAN_RATING] = df[constants.F_AGE_BUCKET_MEAN_RATING].fillna(global_mean)
     if constants.F_PUBLICATION_DECADE_MEAN_RATING in df.columns:
         df[constants.F_PUBLICATION_DECADE_MEAN_RATING] = df[constants.F_PUBLICATION_DECADE_MEAN_RATING].fillna(global_mean)
+    if constants.F_USER_BAYES_MEAN_RATING in df.columns:
+        df[constants.F_USER_BAYES_MEAN_RATING] = df[constants.F_USER_BAYES_MEAN_RATING].fillna(global_mean)
+    if constants.F_BOOK_BAYES_MEAN_RATING in df.columns:
+        df[constants.F_BOOK_BAYES_MEAN_RATING] = df[constants.F_BOOK_BAYES_MEAN_RATING].fillna(global_mean)
+    if constants.F_AUTHOR_BAYES_MEAN_RATING in df.columns:
+        df[constants.F_AUTHOR_BAYES_MEAN_RATING] = df[constants.F_AUTHOR_BAYES_MEAN_RATING].fillna(global_mean)
+    if constants.F_RECENCY_WEIGHTED_USER_MEAN in df.columns:
+        df[constants.F_RECENCY_WEIGHTED_USER_MEAN] = df[constants.F_RECENCY_WEIGHTED_USER_MEAN].fillna(global_mean)
+    if constants.F_RECENCY_WEIGHTED_BOOK_MEAN in df.columns:
+        df[constants.F_RECENCY_WEIGHTED_BOOK_MEAN] = df[constants.F_RECENCY_WEIGHTED_BOOK_MEAN].fillna(global_mean)
+    if constants.F_LF_EXPLICIT_PRED in df.columns:
+        df[constants.F_LF_EXPLICIT_PRED] = df[constants.F_LF_EXPLICIT_PRED].fillna(global_mean)
+    if constants.F_LF_IMPLICIT_PRED in df.columns:
+        df[constants.F_LF_IMPLICIT_PRED] = df[constants.F_LF_IMPLICIT_PRED].fillna(global_mean)
+    if constants.F_SVD_PRED in df.columns:
+        df[constants.F_SVD_PRED] = df[constants.F_SVD_PRED].fillna(global_mean)
+    if constants.F_SVDPP_PRED in df.columns:
+        df[constants.F_SVDPP_PRED] = df[constants.F_SVDPP_PRED].fillna(global_mean)
+    if constants.F_KNN_PRED in df.columns:
+        df[constants.F_KNN_PRED] = df[constants.F_KNN_PRED].fillna(global_mean)
+    if constants.F_ALS_IMPLICIT_PRED in df.columns:
+        df[constants.F_ALS_IMPLICIT_PRED] = df[constants.F_ALS_IMPLICIT_PRED].fillna(global_mean)
+    if constants.F_ALS_EXPLICIT_PRED in df.columns:
+        df[constants.F_ALS_EXPLICIT_PRED] = df[constants.F_ALS_EXPLICIT_PRED].fillna(global_mean)
 
     if constants.F_USER_RATINGS_COUNT in df.columns:
         df[constants.F_USER_RATINGS_COUNT] = df[constants.F_USER_RATINGS_COUNT].fillna(0)
@@ -695,6 +1040,10 @@ def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFr
         df[constants.F_BOOK_BIAS] = df[constants.F_BOOK_BIAS].fillna(0)
     if constants.F_AUTHOR_BIAS in df.columns:
         df[constants.F_AUTHOR_BIAS] = df[constants.F_AUTHOR_BIAS].fillna(0)
+    if constants.F_BASELINE_USER_BOOK in df.columns:
+        df[constants.F_BASELINE_USER_BOOK] = df[constants.F_BASELINE_USER_BOOK].fillna(global_mean)
+    if constants.F_BASELINE_BAYES_BLEND in df.columns:
+        df[constants.F_BASELINE_BAYES_BLEND] = df[constants.F_BASELINE_BAYES_BLEND].fillna(global_mean)
     if constants.F_USER_TOTAL_INTERACTIONS in df.columns:
         df[constants.F_USER_TOTAL_INTERACTIONS] = df[constants.F_USER_TOTAL_INTERACTIONS].fillna(0)
     if constants.F_USER_WISHLIST_COUNT in df.columns:
@@ -722,6 +1071,20 @@ def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFr
         df[constants.F_USER_AUTHOR_MEAN_RATING] = df[constants.F_USER_AUTHOR_MEAN_RATING].fillna(global_mean)
     if constants.F_USER_AUTHOR_RATINGS_COUNT in df.columns:
         df[constants.F_USER_AUTHOR_RATINGS_COUNT] = df[constants.F_USER_AUTHOR_RATINGS_COUNT].fillna(0)
+    if constants.F_USER_GENRE_READ_RATIO in df.columns:
+        df[constants.F_USER_GENRE_READ_RATIO] = df[constants.F_USER_GENRE_READ_RATIO].fillna(0.0)
+    if constants.F_USER_GENRE_WISHLIST_RATIO in df.columns:
+        df[constants.F_USER_GENRE_WISHLIST_RATIO] = df[constants.F_USER_GENRE_WISHLIST_RATIO].fillna(0.0)
+    if constants.F_USER_AUTHOR_READ_RATIO in df.columns:
+        df[constants.F_USER_AUTHOR_READ_RATIO] = df[constants.F_USER_AUTHOR_READ_RATIO].fillna(0.0)
+    if constants.F_USER_LANGUAGE_READ_RATIO in df.columns:
+        df[constants.F_USER_LANGUAGE_READ_RATIO] = df[constants.F_USER_LANGUAGE_READ_RATIO].fillna(0.0)
+    if constants.F_USER_PUBLISHER_READ_RATIO in df.columns:
+        df[constants.F_USER_PUBLISHER_READ_RATIO] = df[constants.F_USER_PUBLISHER_READ_RATIO].fillna(0.0)
+    if constants.F_INTERACTION_AGE_DAYS in df.columns:
+        df[constants.F_INTERACTION_AGE_DAYS] = df[constants.F_INTERACTION_AGE_DAYS].fillna(
+            df[constants.F_INTERACTION_AGE_DAYS].median()
+        )
 
     # Fill missing avg_rating from book_data with global mean
     df[constants.COL_AVG_RATING] = df[constants.COL_AVG_RATING].fillna(global_mean)
@@ -741,7 +1104,11 @@ def handle_missing_values(df: pd.DataFrame, train_df: pd.DataFrame) -> pd.DataFr
     bert_svd_cols = [col for col in df.columns if col.startswith("bert_svd_")]
     for col in bert_svd_cols:
         df[col] = df[col].fillna(0.0)
-    latent_cols = [col for col in df.columns if col.startswith("lf_user_") or col.startswith("lf_book_")]
+    latent_cols = [
+        col
+        for col in df.columns
+        if col.startswith("lf_user_") or col.startswith("lf_book_") or col.startswith("lf_imp_user_") or col.startswith("lf_imp_book_")
+    ]
     for col in latent_cols:
         df[col] = df[col].fillna(0.0)
 
@@ -793,6 +1160,7 @@ def create_features(
         df = add_aggregate_features(df, train_df)
 
     df = add_genre_features(df, book_genres_df)
+    df = add_preference_ratios(df)
     df = add_text_features(df, train_df, descriptions_df)
     df = add_bert_features(df, train_df, descriptions_df)
     df = handle_missing_values(df, train_df)

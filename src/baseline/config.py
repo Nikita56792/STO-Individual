@@ -51,6 +51,9 @@ TORCH_NUM_THREADS = int(os.getenv("TORCH_NUM_THREADS", NUM_THREADS))
 # These flags can be overridden via environment variables for faster experiments
 USE_TFIDF = os.getenv("USE_TFIDF", "1") != "0"
 USE_BERT = os.getenv("USE_BERT", "1") != "0"
+USE_SURPRISE = os.getenv("USE_SURPRISE", "1") != "0"
+USE_IMPLICIT = os.getenv("USE_IMPLICIT", "1") != "0"
+LATENT_DIM = int(os.getenv("LATENT_DIM", "96"))
 
 # --- TEMPORAL SPLIT CONFIG ---
 # Ratio of data to use for training (0 < TEMPORAL_SPLIT_RATIO < 1)
@@ -74,12 +77,40 @@ TFIDF_N_JOBS = NUM_THREADS
 # --- BERT PARAMETERS ---
 BERT_MODEL_NAME = constants.BERT_MODEL_NAME
 BERT_BATCH_SIZE = int(os.getenv("BERT_BATCH_SIZE", "16"))
-BERT_MAX_LENGTH = 512
-BERT_EMBEDDING_DIM = 768
-BERT_SVD_COMPONENTS = int(os.getenv("BERT_SVD_COMPONENTS", "256"))
+BERT_MAX_LENGTH = 320
+BERT_EMBEDDING_DIM = 1024
+BERT_SVD_COMPONENTS = int(os.getenv("BERT_SVD_COMPONENTS", "384"))
 BERT_DEVICE = _detect_bert_device()
 # Limit GPU memory usage to 50% to prevent overheating and OOM errors
 BERT_GPU_MEMORY_FRACTION = float(os.getenv("BERT_GPU_MEMORY_FRACTION", "0.75"))
+
+SURPRISE_SVD_PARAMS = {
+    "n_factors": 128,
+    "n_epochs": 40,
+    "lr_all": 0.006,
+    "reg_all": 0.08,
+    "random_state": RANDOM_STATE,
+}
+SURPRISE_SVDPP_PARAMS = {
+    "n_factors": 96,
+    "n_epochs": 35,
+    "lr_all": 0.005,
+    "reg_all": 0.09,
+    "random_state": RANDOM_STATE,
+}
+SURPRISE_KNN_PARAMS = {
+    "k": 80,
+    "min_k": 3,
+    "sim_options": {"name": "pearson_baseline", "user_based": False},
+}
+
+IMPLICIT_ALS_PARAMS = {
+    "factors": 96,
+    "regularization": 0.08,
+    "alpha": 15.0,
+    "iterations": 30,
+    "random_state": RANDOM_STATE,
+}
 
 
 # --- FEATURES ---
@@ -102,36 +133,36 @@ CAT_FEATURES = [
 # --- CATBOOST PARAMETERS ---
 CATBOOST_PARAMS = {
     "loss_function": "RMSE",
-    "learning_rate": 0.035,
-    "depth": 8,
-    "l2_leaf_reg": 4.0,
-    "min_data_in_leaf": 20,
+    "learning_rate": 0.03,
+    "depth": 9,
+    "l2_leaf_reg": 5.0,
+    "min_data_in_leaf": 18,
     "bootstrap_type": "Bernoulli",
-    "subsample": 0.85,
-    "iterations": 2500,
+    "subsample": 0.88,
+    "iterations": 3200,
     "od_type": "Iter",
-    "od_wait": 60,
+    "od_wait": 80,
     "random_seed": RANDOM_STATE,
     "task_type": "CPU",
     "thread_count": NUM_THREADS,
 }
 
 # Ensemble weights
-ENSEMBLE_WEIGHTS = {"lgb": 1.0, "cat": 0.0}
+ENSEMBLE_WEIGHTS = {"lgb": 0.8, "cat": 0.2}
 
 # --- MODEL PARAMETERS ---
 LGB_PARAMS = {
     "objective": "rmse",
     "metric": "rmse",
-    "n_estimators": 6500,
-    "learning_rate": 0.02,
-    "feature_fraction": 0.85,
-    "bagging_fraction": 0.85,
+    "n_estimators": 12000,
+    "learning_rate": 0.0125,
+    "feature_fraction": 0.92,
+    "bagging_fraction": 0.86,
     "bagging_freq": 1,
-    "lambda_l1": 0.2,
-    "lambda_l2": 0.2,
-    "num_leaves": 192,
-    "min_child_samples": 20,
+    "lambda_l1": 0.12,
+    "lambda_l2": 0.18,
+    "num_leaves": 320,
+    "min_child_samples": 16,
     "min_split_gain": 0.0,
     "max_depth": -1,
     "boost_from_average": True,
@@ -149,4 +180,4 @@ LGB_FIT_PARAMS = {
 }
 
 # Train multiple LightGBM seeds for variance reduction
-LGB_SEEDS = [42, 2025, 7]
+LGB_SEEDS = [42, 2025, 7, 1337, 31415]

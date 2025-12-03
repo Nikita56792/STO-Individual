@@ -10,9 +10,21 @@ import numpy as np
 import pandas as pd
 from catboost import CatBoostRegressor, Pool
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+import json
 
 from . import config, constants
-from .features import add_aggregate_features, handle_missing_values
+from .features import (
+    add_aggregate_features,
+    add_latent_features,
+    add_latent_dot_products,
+    apply_als_models,
+    apply_surprise_models,
+    compute_implicit_latent_factors,
+    compute_latent_factors,
+    handle_missing_values,
+    train_als_models,
+    train_surprise_models,
+)
 from .temporal_split import get_split_date_from_ratio, temporal_split_by_date
 
 
@@ -80,10 +92,30 @@ def train() -> None:
         )
     print("✅ Temporal split validation passed: all validation timestamps are after train timestamps")
 
+    print("\nBuilding latent factors from train split...")
+    user_factors, book_factors = compute_latent_factors(train_split, n_components=config.LATENT_DIM)
+    user_factors_imp, book_factors_imp = compute_implicit_latent_factors(n_components=config.LATENT_DIM)
+
     # Compute aggregate features on train split only (to prevent data leakage)
     print("\nComputing aggregate features on train split only...")
     train_split_with_agg = add_aggregate_features(train_split.copy(), train_split)
     val_split_with_agg = add_aggregate_features(val_split.copy(), train_split)  # Use train_split for aggregates!
+    train_split_with_agg = add_latent_features(train_split_with_agg, user_factors, book_factors)
+    val_split_with_agg = add_latent_features(val_split_with_agg, user_factors, book_factors)
+    train_split_with_agg = add_latent_features(train_split_with_agg, user_factors_imp, book_factors_imp)
+    val_split_with_agg = add_latent_features(val_split_with_agg, user_factors_imp, book_factors_imp)
+    train_split_with_agg = add_latent_dot_products(train_split_with_agg)
+    val_split_with_agg = add_latent_dot_products(val_split_with_agg)
+
+    print("\nFitting Surprise models for additional collaborative signals...")
+    surprise_models = train_surprise_models(train_split)
+    train_split_with_agg = apply_surprise_models(train_split_with_agg, surprise_models)
+    val_split_with_agg = apply_surprise_models(val_split_with_agg, surprise_models)
+
+    print("Fitting ALS models for implicit and explicit patterns...")
+    als_models = train_als_models(train_split)
+    train_split_with_agg = apply_als_models(train_split_with_agg, als_models)
+    val_split_with_agg = apply_als_models(val_split_with_agg, als_models)
 
     # Handle missing values (use train_split for fill values)
     print("Handling missing values...")
@@ -147,12 +179,14 @@ def train() -> None:
 
     # Train CatBoost (works well with categorical features)
     print("\nTraining CatBoost model...")
-    cat_features = [f for f in features if not f.startswith("tfidf_") and not f.startswith("bert_")]
-    cat_feature_cols = [c for c in cat_features if c in config.CAT_FEATURES and X_train[c].dtype.name in ("category", "object")]
-    cat_features_idx = [cat_features.index(c) for c in cat_feature_cols]
+    cat_features_base = [f for f in features if not f.startswith("tfidf_") and not f.startswith("bert_")]
+    cat_feature_cols = [
+        c for c in cat_features_base if c in config.CAT_FEATURES and X_train[c].dtype.name in ("category", "object")
+    ]
+    cat_features_idx = [cat_features_base.index(c) for c in cat_feature_cols]
 
-    X_train_cat = X_train.copy()
-    X_val_cat = X_val.copy()
+    X_train_cat = X_train[cat_features_base].copy()
+    X_val_cat = X_val[cat_features_base].copy()
     for col in cat_feature_cols:
         X_train_cat[col] = X_train_cat[col].astype(str)
         X_val_cat[col] = X_val_cat[col].astype(str)
@@ -187,6 +221,19 @@ def train() -> None:
     mae = mean_absolute_error(y_val, val_preds)
     print(f"\nValidation (ensemble) RMSE: {rmse:.4f}, MAE: {mae:.4f} | w_lgb={w_lgb:.2f} w_cat={w_cat:.2f} | best_score={best_score:.4f}")
 
+    calibration = {
+        "w_lgb": float(w_lgb),
+        "w_cat": float(w_cat),
+        "best_score": float(best_score),
+        "rmse": float(rmse),
+        "mae": float(mae),
+        "split_date": split_date.isoformat(),
+    }
+    calibration_path = config.MODEL_DIR / constants.CALIBRATION_FILENAME
+    with open(calibration_path, "w", encoding="utf-8") as f:
+        json.dump(calibration, f, indent=2)
+    print(f"Saved ensemble weights to {calibration_path}")
+
     # Save models
     model_path = config.MODEL_DIR / config.MODEL_FILENAME
     if lgb_models:
@@ -199,7 +246,18 @@ def train() -> None:
 
     if config.TRAIN_ON_FULL:
         print("\nRetraining both models on full training data (no holdout)...")
+        user_factors_full, book_factors_full = compute_latent_factors(train_set, n_components=config.LATENT_DIM)
+        user_factors_imp_full, book_factors_imp_full = compute_implicit_latent_factors(
+            n_components=config.LATENT_DIM
+        )
         full_train_with_agg = add_aggregate_features(train_set.copy(), train_set)
+        full_train_with_agg = add_latent_features(full_train_with_agg, user_factors_full, book_factors_full)
+        full_train_with_agg = add_latent_features(full_train_with_agg, user_factors_imp_full, book_factors_imp_full)
+        full_train_with_agg = add_latent_dot_products(full_train_with_agg)
+        surprise_models_full = train_surprise_models(train_set)
+        full_train_with_agg = apply_surprise_models(full_train_with_agg, surprise_models_full)
+        als_models_full = train_als_models(train_set)
+        full_train_with_agg = apply_als_models(full_train_with_agg, als_models_full)
         full_train_final = handle_missing_values(full_train_with_agg, train_set)
 
         X_full = full_train_final[features]
@@ -217,7 +275,7 @@ def train() -> None:
                 lgb_full.booster_.save_model(str(model_path))
         print(f"Full LightGBM models saved to {config.MODEL_DIR} (seeds={config.LGB_SEEDS})")
 
-        X_full_cat = X_full[cat_features]
+        X_full_cat = X_full[cat_features_base]
         cat_full_pool = Pool(X_full_cat, label=y_full, cat_features=cat_features_idx)
         cat_full = CatBoostRegressor(**config.CATBOOST_PARAMS, verbose=False)
         cat_full.fit(cat_full_pool)
